@@ -1,0 +1,26 @@
+# GUI Framework
+PyQt5==5.15.10
+PyQt5-Qt5==5.15.2
+PyQt5-sip==12.13.0
+
+# Video Processing
+opencv-python==4.8.1.78
+ffmpeg-python==0.2.0
+
+# Image and Video Hashing
+imagehash==4.3.1
+videohash==3.0.1
+
+# Machine Learning (Optional)
+numpy==1.24.3
+pillow==10.0.1
+
+# Utilities
+tqdm==4.66.1
+send2trash==1.8.2
+
+# Development Dependencies
+pytest==7.4.2
+black==23.9.1
+flake8==6.1.0
+mypy==1.6.1
