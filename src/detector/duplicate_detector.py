@@ -13,20 +13,28 @@ from PIL import Image
 from typing import List, Dict, Any, Callable, Optional, Tuple
 from collections import defaultdict
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import pickle
+import time
 
 class DuplicateDetector:
     """重复视频检测器"""
     
-    def __init__(self, similarity_threshold: float = 80.0, sample_frames: int = 10):
+    def __init__(self, similarity_threshold: float = 80.0, sample_frames: int = 5, max_workers: int = 4):
         """
         初始化检测器
         
         Args:
             similarity_threshold: 相似度阈值（百分比）
-            sample_frames: 采样帧数
+            sample_frames: 采样帧数（减少到5帧提高速度）
+            max_workers: 最大工作线程数
         """
         self.similarity_threshold = similarity_threshold
         self.sample_frames = sample_frames
+        self.max_workers = max_workers
+        self._lock = threading.Lock()
+        self._feature_cache = {}  # 特征缓存
         
     def find_duplicates(self, video_files: List[Dict[str, Any]], 
                        progress_callback: Optional[Callable] = None) -> List[List[Dict[str, Any]]]:
@@ -49,37 +57,32 @@ class DuplicateDetector:
             
         candidate_groups = self.metadata_prescreening(video_files)
         
-        # 第二步：内容特征提取和比较
+        # 第二步：并行提取特征和比较
         if progress_callback:
             progress_callback(60, "正在提取视频特征...")
             
         duplicate_groups = []
         processed_files = set()
         
-        total_candidates = sum(len(group) for group in candidate_groups if len(group) > 1)
-        current_processed = 0
-        
+        # 收集所有需要处理的文件
+        files_to_process = []
         for candidate_group in candidate_groups:
-            if len(candidate_group) < 2:
-                continue
-                
-            # 提取特征
-            features = {}
-            for file_info in candidate_group:
-                if file_info['path'] not in processed_files:
-                    feature = self.extract_video_features(file_info)
-                    if feature is not None:
-                        features[file_info['path']] = {
-                            'feature': feature,
-                            'file_info': file_info
-                        }
-                        
-                current_processed += 1
-                if progress_callback:
-                    progress = 60 + int((current_processed / total_candidates) * 30)
-                    progress_callback(progress, f"正在处理 {file_info['name']}")
+            if len(candidate_group) >= 2:
+                for file_info in candidate_group:
+                    if file_info['path'] not in processed_files:
+                        files_to_process.append((file_info, candidate_group))
+        
+        if not files_to_process:
+            return duplicate_groups
+        
+        # 并行提取特征
+        features_by_group = self._parallel_extract_features(files_to_process, progress_callback)
+        
+        # 比较特征找出重复组
+        if progress_callback:
+            progress_callback(90, "正在比较视频特征...")
             
-            # 比较特征找出重复组
+        for candidate_group, features in features_by_group.items():
             if len(features) > 1:
                 similar_groups = self.find_similar_videos(features)
                 duplicate_groups.extend(similar_groups)
@@ -96,7 +99,7 @@ class DuplicateDetector:
         
     def metadata_prescreening(self, video_files: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         """
-        元数据预筛选
+        优化的元数据预筛选
         
         Args:
             video_files: 视频文件列表
@@ -104,40 +107,175 @@ class DuplicateDetector:
         Returns:
             候选重复组列表
         """
-        # 按时长分组（允许5%的误差）
-        duration_groups = defaultdict(list)
+        # 第一步：按文件大小快速分组（允许15%的误差，提高匹配率）
+        size_groups = defaultdict(list)
         
         for file_info in video_files:
-            duration = file_info.get('duration', 0)
-            if duration > 0:
-                # 将时长归类到5%误差范围内的组
-                duration_key = int(duration / (duration * 0.05 + 1))
-                duration_groups[duration_key].append(file_info)
+            size = file_info.get('size', 0)
+            if size > 0:
+                # 使用对数分组减少组数
+                size_key = int(np.log10(size + 1) * 10)  # 按数量级分组
+                size_groups[size_key].append(file_info)
             else:
-                # 时长未知的文件单独处理
-                duration_groups[-1].append(file_info)
+                size_groups[-1].append(file_info)
         
-        # 进一步按文件大小细分（允许10%误差）
+        # 第二步：在每个大小组内按时长细分（允许10%误差）
         candidate_groups = []
-        for duration_group in duration_groups.values():
-            if len(duration_group) < 2:
-                candidate_groups.append(duration_group)
+        for size_group in size_groups.values():
+            if len(size_group) < 2:
+                # 单个文件的组直接跳过
                 continue
                 
-            size_groups = defaultdict(list)
-            for file_info in duration_group:
-                size = file_info.get('size', 0)
-                if size > 0:
-                    # 将大小归类到10%误差范围内的组
-                    size_key = int(size / (size * 0.1 + 1024))  # 至少1KB的误差
-                    size_groups[size_key].append(file_info)
+            duration_groups = defaultdict(list)
+            for file_info in size_group:
+                duration = file_info.get('duration', 0)
+                if duration > 0:
+                    # 按时长区间分组，减少精度要求
+                    duration_key = int(duration / 30)  # 每30秒一个区间
+                    duration_groups[duration_key].append(file_info)
                 else:
-                    size_groups[-1].append(file_info)
+                    duration_groups[-1].append(file_info)
             
-            candidate_groups.extend(size_groups.values())
+            # 只保留有多个文件的组
+            for duration_group in duration_groups.values():
+                if len(duration_group) >= 2:
+                    candidate_groups.append(duration_group)
         
         return candidate_groups
         
+    def _parallel_extract_features(self, files_to_process, progress_callback=None):
+        """并行提取视频特征"""
+        features_by_group = defaultdict(dict)
+        processed_count = 0
+        total_count = len(files_to_process)
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # 提交所有特征提取任务
+            future_to_file = {
+                executor.submit(self.extract_video_features_cached, file_info): (file_info, group)
+                for file_info, group in files_to_process
+            }
+            
+            # 处理完成的任务
+            for future in as_completed(future_to_file):
+                file_info, candidate_group = future_to_file[future]
+                try:
+                    feature = future.result()
+                    if feature is not None:
+                        group_id = id(candidate_group)  # 使用组对象的ID作为键
+                        with self._lock:
+                            features_by_group[group_id][file_info['path']] = {
+                                'feature': feature,
+                                'file_info': file_info
+                            }
+                    
+                    processed_count += 1
+                    if progress_callback and processed_count % 5 == 0:  # 每5个文件更新一次
+                        progress = 60 + int((processed_count / total_count) * 25)
+                        progress_callback(progress, f"已处理 {processed_count}/{total_count} 个视频")
+                        
+                except Exception as e:
+                    print(f"处理文件 {file_info['path']} 时发生错误: {e}")
+        
+        return dict(features_by_group)
+        
+    def extract_video_features_cached(self, file_info: Dict[str, Any]) -> Optional[np.ndarray]:
+        """
+        带缓存的视频特征提取
+        
+        Args:
+            file_info: 视频文件信息
+            
+        Returns:
+            视频特征向量
+        """
+        file_path = file_info['path']
+        file_mtime = file_info.get('mtime', 0)
+        cache_key = f"{file_path}_{file_mtime}_{self.sample_frames}"
+        
+        # 检查缓存
+        if cache_key in self._feature_cache:
+            return self._feature_cache[cache_key]
+        
+        # 提取特征
+        feature = self.extract_video_features_fast(file_info)
+        
+        # 缓存特征
+        if feature is not None:
+            self._feature_cache[cache_key] = feature
+        
+        return feature
+    
+    def extract_video_features_fast(self, file_info: Dict[str, Any]) -> Optional[np.ndarray]:
+        """
+        快速提取视频特征（优化版本）
+        
+        Args:
+            file_info: 视频文件信息
+            
+        Returns:
+            视频特征向量
+        """
+        try:
+            video_path = file_info['path']
+            cap = cv2.VideoCapture(video_path)
+            
+            if not cap.isOpened():
+                return None
+            
+            # 获取视频基本信息
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            if total_frames == 0:
+                cap.release()
+                return None
+            
+            # 计算采样间隔，减少采样帧数提高速度
+            if total_frames <= self.sample_frames:
+                frame_indices = list(range(0, total_frames, max(1, total_frames // self.sample_frames)))
+            else:
+                # 均匀采样，但跳过开头和结尾的10%（通常是黑屏或片尾）
+                start_frame = int(total_frames * 0.1)
+                end_frame = int(total_frames * 0.9)
+                frame_indices = np.linspace(start_frame, end_frame, self.sample_frames, dtype=int)
+            
+            # 提取关键帧的感知哈希
+            frame_hashes = []
+            
+            for frame_idx in frame_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                
+                if ret:
+                    # 缩小图像尺寸加快处理速度
+                    height, width = frame.shape[:2]
+                    if width > 320 or height > 240:
+                        scale = min(320/width, 240/height)
+                        new_width = int(width * scale)
+                        new_height = int(height * scale)
+                        frame = cv2.resize(frame, (new_width, new_height))
+                    
+                    # 转换为PIL图像
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(frame_rgb)
+                    
+                    # 计算感知哈希（使用更小的哈希尺寸）
+                    phash = imagehash.phash(pil_image, hash_size=6)  # 从8减少到6
+                    frame_hashes.append(np.array(phash.hash, dtype=np.uint8))
+            
+            cap.release()
+            
+            if frame_hashes:
+                # 将所有帧哈希连接成特征向量
+                feature_vector = np.concatenate(frame_hashes)
+                return feature_vector
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"提取视频特征失败 {file_info['path']}: {e}")
+            return None
+
     def extract_video_features(self, file_info: Dict[str, Any]) -> Optional[np.ndarray]:
         """
         提取视频特征

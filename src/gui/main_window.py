@@ -6,11 +6,15 @@ Main Window GUI
 """
 
 import os
+import time
+import subprocess
+import platform
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QPushButton, QListWidget, QProgressBar,
                              QTabWidget, QTreeWidget, QTreeWidgetItem, QComboBox,
                              QSlider, QSpinBox, QGroupBox, QCheckBox, QTextEdit,
-                             QFileDialog, QMessageBox, QSplitter, QFrame)
+                             QFileDialog, QMessageBox, QSplitter, QFrame, QGridLayout,
+                             QMenu, QAction)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QIcon
 
@@ -23,18 +27,30 @@ from utils.config import config
 class ScanWorker(QThread):
     """扫描工作线程"""
     progress_updated = pyqtSignal(int, str)  # 进度, 当前文件
-    scan_completed = pyqtSignal(list)  # 扫描完成，返回重复组
+    scan_completed = pyqtSignal(list, dict)  # 扫描完成，返回重复组和统计信息
     error_occurred = pyqtSignal(str)  # 错误信息
+    stats_updated = pyqtSignal(dict)  # 统计信息更新
     
     def __init__(self, paths, similarity_threshold=80):
         super().__init__()
         self.paths = paths
         self.similarity_threshold = similarity_threshold
         self.is_cancelled = False
+        self.start_time = None
+        self.stats = {
+            'scan_start_time': '',
+            'total_files': 0,
+            'total_size': 0,
+            'elapsed_time': 0
+        }
     
     def run(self):
         """运行扫描"""
         try:
+            # 记录开始时间
+            self.start_time = time.time()
+            self.stats['scan_start_time'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.start_time))
+            
             # 初始化扫描器和检测器
             scanner = VideoScanner()
             detector = DuplicateDetector(similarity_threshold=self.similarity_threshold)
@@ -42,11 +58,24 @@ class ScanWorker(QThread):
             # 扫描视频文件
             self.progress_updated.emit(10, "正在扫描视频文件...")
             video_files = []
+            total_size = 0
+            
             for path in self.paths:
                 if self.is_cancelled:
                     return
-                files = scanner.scan_directory(path)
+                files = scanner.scan_directory(path, progress_callback=self.update_progress)
                 video_files.extend(files)
+                
+                # 计算总大小
+                for file_info in files:
+                    if 'size' in file_info:
+                        total_size += file_info['size']
+                
+                # 更新统计信息
+                self.stats['total_files'] = len(video_files)
+                self.stats['total_size'] = total_size
+                self.stats['elapsed_time'] = int(time.time() - self.start_time)
+                self.stats_updated.emit(self.stats.copy())
             
             if not video_files:
                 self.error_occurred.emit("未找到任何视频文件")
@@ -58,7 +87,9 @@ class ScanWorker(QThread):
                                                       progress_callback=self.update_progress)
             
             if not self.is_cancelled:
-                self.scan_completed.emit(duplicate_groups)
+                # 计算最终统计信息
+                self.stats['elapsed_time'] = int(time.time() - self.start_time)
+                self.scan_completed.emit(duplicate_groups, self.stats.copy())
                 
         except Exception as e:
             self.error_occurred.emit(f"扫描过程中发生错误: {str(e)}")
@@ -67,6 +98,10 @@ class ScanWorker(QThread):
         """更新进度"""
         if not self.is_cancelled:
             self.progress_updated.emit(progress, message)
+            # 更新统计信息
+            if self.start_time:
+                self.stats['elapsed_time'] = int(time.time() - self.start_time)
+                self.stats_updated.emit(self.stats.copy())
     
     def cancel(self):
         """取消扫描"""
@@ -79,6 +114,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.scan_worker = None
         self.duplicate_groups = []
+        self.scan_stats = {}
         self.init_ui()
         
     def init_ui(self):
@@ -194,6 +230,30 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         progress_layout.addWidget(self.status_label)
         
+        # 统计信息区域
+        stats_layout = QGridLayout()
+        
+        # 扫描开始时间
+        stats_layout.addWidget(QLabel("开始时间:"), 0, 0)
+        self.start_time_label = QLabel("--")
+        stats_layout.addWidget(self.start_time_label, 0, 1)
+        
+        # 已扫描文件数
+        stats_layout.addWidget(QLabel("文件数量:"), 0, 2)
+        self.file_count_label = QLabel("0")
+        stats_layout.addWidget(self.file_count_label, 0, 3)
+        
+        # 已扫描文件大小
+        stats_layout.addWidget(QLabel("文件大小:"), 1, 0)
+        self.file_size_label = QLabel("0 B")
+        stats_layout.addWidget(self.file_size_label, 1, 1)
+        
+        # 已用时间
+        stats_layout.addWidget(QLabel("已用时间:"), 1, 2)
+        self.elapsed_time_label = QLabel("0秒")
+        stats_layout.addWidget(self.elapsed_time_label, 1, 3)
+        
+        progress_layout.addLayout(stats_layout)
         parent.addWidget(progress_group)
         
     def create_results_section(self, parent):
@@ -205,6 +265,8 @@ class MainWindow(QMainWindow):
         self.results_tree = QTreeWidget()
         self.results_tree.setHeaderLabels(["文件路径", "大小", "分辨率", "时长", "相似度"])
         self.results_tree.setAlternatingRowColors(True)
+        self.results_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.results_tree.customContextMenuRequested.connect(self.show_context_menu)
         results_layout.addWidget(self.results_tree)
         
         parent.addWidget(results_group)
@@ -272,6 +334,7 @@ class MainWindow(QMainWindow):
         self.scan_worker.progress_updated.connect(self.update_progress)
         self.scan_worker.scan_completed.connect(self.scan_completed)
         self.scan_worker.error_occurred.connect(self.scan_error)
+        self.scan_worker.stats_updated.connect(self.update_stats)
         
         # 更新UI状态
         self.start_scan_btn.setEnabled(False)
@@ -279,6 +342,9 @@ class MainWindow(QMainWindow):
         self.process_btn.setEnabled(False)
         self.progress_bar.setValue(0)
         self.results_tree.clear()
+        
+        # 重置统计信息显示
+        self.reset_stats_display()
         
         self.scan_worker.start()
         
@@ -295,18 +361,26 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(progress)
         self.status_label.setText(message)
         
-    def scan_completed(self, duplicate_groups):
+    def scan_completed(self, duplicate_groups, stats):
         """扫描完成"""
         self.duplicate_groups = duplicate_groups
+        self.scan_stats = stats
         self.display_results(duplicate_groups)
         self.reset_ui_state()
         self.process_btn.setEnabled(len(duplicate_groups) > 0)
         
         # 显示完成消息
         total_duplicates = sum(len(group) for group in duplicate_groups)
+        elapsed_time = self.format_time(stats.get('elapsed_time', 0))
+        file_size = self.format_size(stats.get('total_size', 0))
+        
         QMessageBox.information(self, "扫描完成", 
-                              f"扫描完成！找到 {len(duplicate_groups)} 组重复文件，"
-                              f"共 {total_duplicates} 个重复文件。")
+                              f"扫描完成！\n"
+                              f"扫描文件: {stats.get('total_files', 0)} 个\n"
+                              f"文件大小: {file_size}\n"
+                              f"用时: {elapsed_time}\n"
+                              f"找到重复组: {len(duplicate_groups)} 组\n"
+                              f"重复文件: {total_duplicates} 个")
         
     def scan_error(self, error_message):
         """扫描错误"""
@@ -319,6 +393,85 @@ class MainWindow(QMainWindow):
         self.stop_scan_btn.setEnabled(False)
         self.status_label.setText("就绪")
         self.progress_bar.setValue(0)
+        
+    def reset_stats_display(self):
+        """重置统计信息显示"""
+        self.start_time_label.setText("--")
+        self.file_count_label.setText("0")
+        self.file_size_label.setText("0 B")
+        self.elapsed_time_label.setText("0秒")
+        
+    def update_stats(self, stats):
+        """更新统计信息显示"""
+        self.start_time_label.setText(stats.get('scan_start_time', '--'))
+        self.file_count_label.setText(str(stats.get('total_files', 0)))
+        self.file_size_label.setText(self.format_size(stats.get('total_size', 0)))
+        self.elapsed_time_label.setText(self.format_time(stats.get('elapsed_time', 0)))
+        
+    def format_time(self, seconds):
+        """格式化时间"""
+        if seconds < 60:
+            return f"{seconds}秒"
+        elif seconds < 3600:
+            return f"{seconds//60}分{seconds%60}秒"
+        else:
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            secs = seconds % 60
+            return f"{hours}时{minutes}分{secs}秒"
+            
+    def show_context_menu(self, position):
+        """显示右键上下文菜单"""
+        item = self.results_tree.itemAt(position)
+        if item is None:
+            return
+            
+        # 只为文件项显示菜单（不是组项）
+        if item.parent() is None:
+            return
+            
+        file_path = item.text(0)
+        if not file_path or not os.path.exists(file_path):
+            return
+            
+        menu = QMenu(self)
+        
+        # 打开文件
+        open_file_action = QAction("打开文件", self)
+        open_file_action.triggered.connect(lambda: self.open_file(file_path))
+        menu.addAction(open_file_action)
+        
+        # 打开文件所在目录
+        open_folder_action = QAction("打开文件所在目录", self)
+        open_folder_action.triggered.connect(lambda: self.open_file_location(file_path))
+        menu.addAction(open_folder_action)
+        
+        menu.exec_(self.results_tree.mapToGlobal(position))
+        
+    def open_file(self, file_path):
+        """打开文件"""
+        try:
+            if platform.system() == 'Windows':
+                os.startfile(file_path)
+            elif platform.system() == 'Darwin':  # macOS
+                subprocess.run(['open', file_path])
+            else:  # Linux
+                subprocess.run(['xdg-open', file_path])
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法打开文件: {str(e)}")
+            
+    def open_file_location(self, file_path):
+        """打开文件所在目录"""
+        try:
+            if platform.system() == 'Windows':
+                subprocess.run(['explorer', '/select,', file_path])
+            elif platform.system() == 'Darwin':  # macOS
+                subprocess.run(['open', '-R', file_path])
+            else:  # Linux
+                folder_path = os.path.dirname(file_path)
+                subprocess.run(['xdg-open', folder_path])
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法打开文件所在目录: {str(e)}")
         
     def display_results(self, duplicate_groups):
         """显示结果"""

@@ -13,14 +13,14 @@ from gui.main_window import MainWindow
 
 def main():
     """主函数"""
+    # 设置高DPI支持（必须在创建QApplication之前）
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
     # 创建应用程序
     app = QApplication(sys.argv)
     app.setApplicationName("视频查重工具")
     app.setApplicationVersion("1.0.0")
-    
-    # 设置高DPI支持
-    app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     
     # 创建主窗口
     window = MainWindow()

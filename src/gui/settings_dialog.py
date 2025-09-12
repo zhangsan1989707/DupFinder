@@ -233,7 +233,8 @@ class SettingsDialog(QDialog):
                 break
                 
         self.backup_folder_edit.setText(config.get('backup_folder', ''))
-        self.on_processing_mode_changed(processing_mode)
+        # 使用当前索引而不是处理模式字符串
+        self.on_processing_mode_changed(self.processing_mode_combo.currentIndex())
         
         # 界面设置
         theme = config.get('ui_theme', 'default')
