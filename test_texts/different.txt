@@ -1,0 +1,5 @@
+这是一个完全不同的文件。
+内容与其他文件没有任何相似性。
+This is a completely different file.
+The content has no similarity with other files.
+用于测试不相关文件不会被误判为重复。

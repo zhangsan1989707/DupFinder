@@ -19,22 +19,27 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QIcon
 
 from scanner.video_scanner import VideoScanner
+from scanner.text_scanner import TextScanner
+from scanner.image_scanner import ImageScanner
 from detector.duplicate_detector import DuplicateDetector
+from detector.text_duplicate_detector import TextDuplicateDetector
+from detector.image_duplicate_detector import ImageDuplicateDetector
 from processor.file_processor import FileProcessor
 from gui.settings_dialog import SettingsDialog
 from utils.config import config
 
 class ScanWorker(QThread):
     """扫描工作线程"""
-    progress_updated = pyqtSignal(int, str)  # 进度, 当前文件
-    scan_completed = pyqtSignal(list, dict)  # 扫描完成，返回重复组和统计信息
-    error_occurred = pyqtSignal(str)  # 错误信息
-    stats_updated = pyqtSignal(dict)  # 统计信息更新
+    progress_updated = pyqtSignal(int, str)  # 进度更新信号
+    scan_completed = pyqtSignal(list, dict)  # 扫描完成信号
+    error_occurred = pyqtSignal(str)  # 错误发生信号
+    stats_updated = pyqtSignal(dict)  # 统计信息更新信号
     
-    def __init__(self, paths, similarity_threshold=80):
+    def __init__(self, paths, similarity_threshold=80, scan_mode='video'):
         super().__init__()
         self.paths = paths
         self.similarity_threshold = similarity_threshold
+        self.scan_mode = scan_mode  # 'video' or 'text' or 'image'
         self.is_cancelled = False
         self.start_time = None
         self.stats = {
@@ -51,48 +56,131 @@ class ScanWorker(QThread):
             self.start_time = time.time()
             self.stats['scan_start_time'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.start_time))
             
-            # 初始化扫描器和检测器
-            scanner = VideoScanner()
-            detector = DuplicateDetector(similarity_threshold=self.similarity_threshold)
+            if self.scan_mode == 'text':
+                self._run_text_scan()
+            elif self.scan_mode == 'image':
+                self._run_image_scan()
+            else:
+                self._run_video_scan()
+                
+        except Exception as e:
+            self.error_occurred.emit(f"扫描过程中发生错误: {str(e)}")
+    
+    def _run_video_scan(self):
+        """运行视频扫描"""
+        # 初始化扫描器和检测器
+        scanner = VideoScanner()
+        detector = DuplicateDetector(similarity_threshold=self.similarity_threshold)
+        
+        # 扫描视频文件
+        self.progress_updated.emit(5, "开始扫描视频文件...")
+        video_files = []
+        total_size = 0
+        
+        for i, path in enumerate(self.paths):
+            if self.is_cancelled:
+                return
             
-            # 扫描视频文件
-            self.progress_updated.emit(10, "正在扫描视频文件...")
-            video_files = []
-            total_size = 0
+            # 更新路径扫描进度
+            path_progress = f"扫描路径 {i+1}/{len(self.paths)}: {os.path.basename(path)}"
+            self.progress_updated.emit(5 + i * 5, path_progress)
             
-            for path in self.paths:
+            # 创建进度回调函数，实时更新统计信息
+            def progress_callback_with_stats(progress, message):
                 if self.is_cancelled:
                     return
-                files = scanner.scan_directory(path, progress_callback=self.update_progress)
-                video_files.extend(files)
-                
-                # 计算总大小
-                for file_info in files:
-                    if 'size' in file_info:
-                        total_size += file_info['size']
-                
-                # 更新统计信息
+                self.update_progress(progress, message)
+                # 实时更新统计信息
                 self.stats['total_files'] = len(video_files)
                 self.stats['total_size'] = total_size
                 self.stats['elapsed_time'] = int(time.time() - self.start_time)
                 self.stats_updated.emit(self.stats.copy())
             
-            if not video_files:
-                self.error_occurred.emit("未找到任何视频文件")
+            files = scanner.scan_directory(path, progress_callback=progress_callback_with_stats)
+            video_files.extend(files)
+            
+            # 实时计算总大小
+            for file_info in files:
+                if 'size' in file_info:
+                    total_size += file_info['size']
+        
+        if not video_files:
+            self.error_occurred.emit("未找到任何视频文件")
+            return
+        
+        # 最终更新统计信息
+        self.stats['total_files'] = len(video_files)
+        self.stats['total_size'] = total_size
+        self.stats['elapsed_time'] = int(time.time() - self.start_time)
+        self.stats_updated.emit(self.stats.copy())
+        
+        # 检测重复文件
+        self.progress_updated.emit(95, f"找到 {len(video_files)} 个视频文件，开始重复检测...")
+        duplicate_groups = detector.find_duplicates(video_files, 
+                                                  progress_callback=self.update_progress)
+        
+        if not self.is_cancelled:
+            # 计算最终统计信息
+            self.stats['elapsed_time'] = int(time.time() - self.start_time)
+            self.scan_completed.emit(duplicate_groups, self.stats.copy())
+    
+    def _run_text_scan(self):
+        """运行文本扫描"""
+        # 初始化扫描器和检测器
+        scanner = TextScanner()
+        detector = TextDuplicateDetector(similarity_threshold=self.similarity_threshold)
+        
+        # 扫描文本文件
+        self.progress_updated.emit(5, "开始扫描文本文件...")
+        text_files = []
+        total_size = 0
+        
+        for i, path in enumerate(self.paths):
+            if self.is_cancelled:
                 return
             
-            # 检测重复文件
-            self.progress_updated.emit(30, f"找到 {len(video_files)} 个视频文件，开始分析...")
-            duplicate_groups = detector.find_duplicates(video_files, 
-                                                      progress_callback=self.update_progress)
+            # 更新路径扫描进度
+            path_progress = f"扫描路径 {i+1}/{len(self.paths)}: {os.path.basename(path)}"
+            self.progress_updated.emit(5 + i * 5, path_progress)
             
-            if not self.is_cancelled:
-                # 计算最终统计信息
+            # 创建进度回调函数，实时更新统计信息
+            def progress_callback_with_stats(progress, message):
+                if self.is_cancelled:
+                    return
+                self.update_progress(progress, message)
+                # 实时更新统计信息
+                self.stats['total_files'] = len(text_files)
+                self.stats['total_size'] = total_size
                 self.stats['elapsed_time'] = int(time.time() - self.start_time)
-                self.scan_completed.emit(duplicate_groups, self.stats.copy())
-                
-        except Exception as e:
-            self.error_occurred.emit(f"扫描过程中发生错误: {str(e)}")
+                self.stats_updated.emit(self.stats.copy())
+            
+            files = scanner.scan_directory(path, progress_callback=progress_callback_with_stats)
+            text_files.extend(files)
+            
+            # 实时计算总大小
+            for file_info in files:
+                if 'size' in file_info:
+                    total_size += file_info['size']
+        
+        if not text_files:
+            self.error_occurred.emit("未找到任何文本文件")
+            return
+        
+        # 最终更新统计信息
+        self.stats['total_files'] = len(text_files)
+        self.stats['total_size'] = total_size
+        self.stats['elapsed_time'] = int(time.time() - self.start_time)
+        self.stats_updated.emit(self.stats.copy())
+        
+        # 检测重复文件
+        self.progress_updated.emit(95, f"找到 {len(text_files)} 个文本文件，开始重复检测...")
+        duplicate_groups = detector.find_duplicates(text_files, 
+                                                  progress_callback=self.update_progress)
+        
+        if not self.is_cancelled:
+            # 计算最终统计信息
+            self.stats['elapsed_time'] = int(time.time() - self.start_time)
+            self.scan_completed.emit(duplicate_groups, self.stats.copy())
     
     def update_progress(self, progress, message):
         """更新进度"""
@@ -102,6 +190,64 @@ class ScanWorker(QThread):
             if self.start_time:
                 self.stats['elapsed_time'] = int(time.time() - self.start_time)
                 self.stats_updated.emit(self.stats.copy())
+    
+    def _run_image_scan(self):
+        """运行图片扫描"""
+        # 初始化扫描器和检测器
+        scanner = ImageScanner()
+        detector = ImageDuplicateDetector(similarity_threshold=self.similarity_threshold)
+        
+        # 扫描图片文件
+        self.progress_updated.emit(5, "开始扫描图片文件...")
+        image_files = []
+        total_size = 0
+        
+        for i, path in enumerate(self.paths):
+            if self.is_cancelled:
+                return
+            
+            # 更新路径扫描进度
+            path_progress = f"扫描路径 {i+1}/{len(self.paths)}: {os.path.basename(path)}"
+            self.progress_updated.emit(5 + i * 5, path_progress)
+            
+            # 创建进度回调函数，实时更新统计信息
+            def progress_callback_with_stats(progress, message):
+                if self.is_cancelled:
+                    return
+                self.update_progress(progress, message)
+                # 实时更新统计信息
+                self.stats['total_files'] = len(image_files)
+                self.stats['total_size'] = total_size
+                self.stats['elapsed_time'] = int(time.time() - self.start_time)
+                self.stats_updated.emit(self.stats.copy())
+            
+            files = scanner.scan_directory(path, progress_callback=progress_callback_with_stats)
+            image_files.extend(files)
+            
+            # 实时计算总大小
+            for file_info in files:
+                if 'size' in file_info:
+                    total_size += file_info['size']
+        
+        if not image_files:
+            self.error_occurred.emit("未找到任何图片文件")
+            return
+        
+        # 最终更新统计信息
+        self.stats['total_files'] = len(image_files)
+        self.stats['total_size'] = total_size
+        self.stats['elapsed_time'] = int(time.time() - self.start_time)
+        self.stats_updated.emit(self.stats.copy())
+        
+        # 检测重复文件
+        self.progress_updated.emit(95, f"找到 {len(image_files)} 个图片文件，开始重复检测...")
+        duplicate_groups = detector.find_duplicates(image_files, 
+                                                  progress_callback=self.update_progress)
+        
+        if not self.is_cancelled:
+            # 计算最终统计信息
+            self.stats['elapsed_time'] = int(time.time() - self.start_time)
+            self.scan_completed.emit(duplicate_groups, self.stats.copy())
     
     def cancel(self):
         """取消扫描"""
@@ -115,11 +261,12 @@ class MainWindow(QMainWindow):
         self.scan_worker = None
         self.duplicate_groups = []
         self.scan_stats = {}
+        self.current_mode = 'video'  # 'video' or 'text' or 'image'
         self.init_ui()
         
     def init_ui(self):
         """初始化用户界面"""
-        self.setWindowTitle("视频文件智能查重工具 v1.0")
+        self.setWindowTitle("智能文件查重工具 v1.0")
         self.setGeometry(100, 100, 1200, 800)
         
         # 创建中央窗口部件
@@ -154,6 +301,15 @@ class MainWindow(QMainWindow):
     def create_toolbar(self, parent_layout):
         """创建顶部工具栏"""
         toolbar_layout = QHBoxLayout()
+        
+        # 模式选择
+        toolbar_layout.addWidget(QLabel("扫描模式:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["视频查重", "文本查重", "图片查重"])
+        self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
+        toolbar_layout.addWidget(self.mode_combo)
+        
+        toolbar_layout.addWidget(QLabel("  "))  # 分隔符
         
         # 添加路径按钮
         self.add_path_btn = QPushButton("添加路径")
@@ -263,7 +419,7 @@ class MainWindow(QMainWindow):
         
         # 结果树
         self.results_tree = QTreeWidget()
-        self.results_tree.setHeaderLabels(["文件路径", "大小", "分辨率", "时长", "相似度"])
+        self.results_tree.setHeaderLabels(["文件路径", "大小", "属性1", "属性2", "相似度"])
         self.results_tree.setAlternatingRowColors(True)
         self.results_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.results_tree.customContextMenuRequested.connect(self.show_context_menu)
@@ -279,7 +435,7 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(QLabel("选择策略:"))
         self.strategy_combo = QComboBox()
         self.strategy_combo.addItems([
-            "手动选择", "保留最大分辨率", "保留最小大小", 
+            "手动选择", "保留最大尺寸", "保留最小大小", 
             "保留最新文件", "保留最旧文件"
         ])
         action_layout.addWidget(self.strategy_combo)
@@ -319,6 +475,23 @@ class MainWindow(QMainWindow):
     def update_similarity_label(self, value):
         """更新相似度标签"""
         self.similarity_label.setText(f"{value}%")
+    
+    def on_mode_changed(self, mode_text):
+        """模式切换处理"""
+        if mode_text == "视频查重":
+            self.current_mode = 'video'
+            self.setWindowTitle("智能文件查重工具 v1.0 - 视频模式")
+        elif mode_text == "文本查重":
+            self.current_mode = 'text'
+            self.setWindowTitle("智能文件查重工具 v1.0 - 文本模式")
+        else:
+            self.current_mode = 'image'
+            self.setWindowTitle("智能文件查重工具 v1.0 - 图片模式")
+        
+        # 清空当前结果
+        self.results_tree.clear()
+        self.duplicate_groups = []
+        self.process_btn.setEnabled(False)
         
     def start_scan(self):
         """开始扫描"""
@@ -330,7 +503,7 @@ class MainWindow(QMainWindow):
         paths = [self.path_list.item(i).text() for i in range(self.path_list.count())]
         
         # 创建并启动扫描线程
-        self.scan_worker = ScanWorker(paths, self.similarity_slider.value())
+        self.scan_worker = ScanWorker(paths, self.similarity_slider.value(), self.current_mode)
         self.scan_worker.progress_updated.connect(self.update_progress)
         self.scan_worker.scan_completed.connect(self.scan_completed)
         self.scan_worker.error_occurred.connect(self.scan_error)
@@ -345,6 +518,10 @@ class MainWindow(QMainWindow):
         
         # 重置统计信息显示
         self.reset_stats_display()
+        
+        # 根据模式设置状态文本
+        mode_text = {"video": "视频", "text": "文本", "image": "图片"}.get(self.current_mode, "文件")
+        self.status_label.setText(f"准备扫描{mode_text}...")
         
         self.scan_worker.start()
         
@@ -477,6 +654,14 @@ class MainWindow(QMainWindow):
         """显示结果"""
         self.results_tree.clear()
         
+        # 更新列标题
+        if self.current_mode == 'text':
+            self.results_tree.setHeaderLabels(["文件路径", "大小", "行数", "字符数", "相似度"])
+        elif self.current_mode == 'image':
+            self.results_tree.setHeaderLabels(["文件路径", "大小", "分辨率", "格式", "相似度"])
+        else:  # video
+            self.results_tree.setHeaderLabels(["文件路径", "大小", "分辨率", "时长", "相似度"])
+        
         for i, group in enumerate(duplicate_groups):
             # 创建组节点
             group_item = QTreeWidgetItem(self.results_tree)
@@ -488,8 +673,20 @@ class MainWindow(QMainWindow):
                 file_item = QTreeWidgetItem(group_item)
                 file_item.setText(0, file_info['path'])
                 file_item.setText(1, self.format_size(file_info['size']))
-                file_item.setText(2, f"{file_info.get('width', 'N/A')}x{file_info.get('height', 'N/A')}")
-                file_item.setText(3, self.format_duration(file_info.get('duration', 0)))
+                
+                if self.current_mode == 'text':
+                    # 文本文件显示行数和字符数
+                    file_item.setText(2, str(file_info.get('line_count', 'N/A')))
+                    file_item.setText(3, str(file_info.get('char_count', 'N/A')))
+                elif self.current_mode == 'image':
+                    # 图片文件显示分辨率和格式
+                    file_item.setText(2, f"{file_info.get('width', 'N/A')}x{file_info.get('height', 'N/A')}")
+                    file_item.setText(3, file_info.get('format', 'N/A'))
+                else:
+                    # 视频文件显示分辨率和时长
+                    file_item.setText(2, f"{file_info.get('width', 'N/A')}x{file_info.get('height', 'N/A')}")
+                    file_item.setText(3, self.format_duration(file_info.get('duration', 0)))
+                
                 file_item.setText(4, f"{file_info.get('similarity', 100):.1f}%")
                 file_item.setCheckState(0, Qt.Unchecked)
                 
@@ -542,9 +739,13 @@ class MainWindow(QMainWindow):
             
         children = [group_item.child(i) for i in range(group_item.childCount())]
         
-        if strategy == "保留最大分辨率":
-            # 选择分辨率最大的文件
-            return max(children, key=lambda x: self.get_resolution_score(x.text(2)))
+        if strategy == "保留最大尺寸":
+            if self.current_mode == 'text':
+                # 文本模式：选择字符数最多的文件
+                return max(children, key=lambda x: self.parse_number(x.text(3)))
+            else:
+                # 图片和视频模式：选择分辨率最大的文件
+                return max(children, key=lambda x: self.get_resolution_score(x.text(2)))
         elif strategy == "保留最小大小":
             # 选择文件大小最小的
             return min(children, key=lambda x: self.parse_size(x.text(1)))
@@ -579,6 +780,15 @@ class MainWindow(QMainWindow):
         except:
             pass
         return 0
+    
+    def parse_number(self, number_text):
+        """解析数字"""
+        try:
+            if number_text == 'N/A':
+                return 0
+            return int(number_text)
+        except:
+            return 0
         
     def process_files(self):
         """处理文件"""

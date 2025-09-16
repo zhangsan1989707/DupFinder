@@ -15,6 +15,9 @@ videohash==3.0.1
 numpy==1.24.3
 pillow==10.0.1
 
+# Text Processing
+chardet==5.2.0
+
 # Utilities
 tqdm==4.66.1
 send2trash==1.8.2
@@ -24,3 +27,6 @@ pytest==7.4.2
 black==23.9.1
 flake8==6.1.0
 mypy==1.6.1
+
+# Packaging Dependencies
+pyinstaller==6.1.0

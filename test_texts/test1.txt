@@ -1,0 +1,4 @@
+这是一个测试文本文件。
+它包含了一些中文和英文内容。
+This file is used for testing text duplicate detection.
+我们可以测试文本查重功能是否正常工作。
